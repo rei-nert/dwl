@@ -83,8 +83,12 @@
 
 /* enums */
 enum { CurNormal, CurPressed, CurMove, CurResize }; /* cursor */
-enum { XDGShell, LayerShell, X11 }; /* client types */
-enum { LyrBg, LyrBottom, LyrTile, LyrFloat, LyrTop, LyrFS, LyrOverlay, LyrBlock, NUM_LAYERS }; /* scene layers */
+enum { XDGShell, LayerShell, X11Managed, X11Unmanaged }; /* client types */
+enum { LyrBg, LyrBottom, LyrTile, LyrFloat, LyrFS, LyrTop, LyrOverlay, LyrBlock, NUM_LAYERS }; /* scene layers */
+#ifdef XWAYLAND
+enum { NetWMWindowTypeDialog, NetWMWindowTypeSplash, NetWMWindowTypeToolbar,
+	NetWMWindowTypeUtility, NetLast }; /* EWMH atoms */
+#endif
 
 typedef union {
 	int i;
@@ -361,7 +365,6 @@ static struct wl_event_loop *event_loop;
 static struct wlr_backend *backend;
 static struct wlr_scene *scene;
 static struct wlr_scene_tree *layers[NUM_LAYERS];
-static struct wlr_scene_tree *drag_icon;
 /* Map from ZWLR_LAYER_SHELL_* constants to Lyr* enum */
 static const int layermap[] = { LyrBg, LyrBottom, LyrTop, LyrOverlay };
 static struct wlr_renderer *drw;
@@ -814,10 +817,10 @@ closemon(Monitor *m)
 void
 commitlayersurfacenotify(struct wl_listener *listener, void *data)
 {
-	LayerSurface *l = wl_container_of(listener, l, surface_commit);
-	struct wlr_layer_surface_v1 *layer_surface = l->layer_surface;
-	struct wlr_scene_tree *scene_layer = layers[layermap[layer_surface->current.layer]];
-	struct wlr_layer_surface_v1_state old_state;
+	LayerSurface *layersurface = wl_container_of(listener, layersurface, surface_commit);
+	struct wlr_layer_surface_v1 *wlr_layer_surface = layersurface->layer_surface;
+	struct wlr_output *wlr_output = wlr_layer_surface->output;
+	struct wlr_scene_tree *layer = layers[layermap[wlr_layer_surface->current.layer]];
 
 	if (l->layer_surface->initial_commit) {
 		client_set_scale(layer_surface->surface, l->mon->wlr_output->scale);
@@ -829,6 +832,13 @@ commitlayersurfacenotify(struct wl_listener *listener, void *data)
 		arrangelayers(l->mon);
 		l->layer_surface->current = old_state;
 		return;
+
+	if (layer != layersurface->scene->node.parent) {
+		wlr_scene_node_reparent(&layersurface->scene->node, layer);
+		wlr_scene_node_reparent(&layersurface->popups->node, layer);
+		wl_list_remove(&layersurface->link);
+		wl_list_insert(&layersurface->mon->layers[wlr_layer_surface->current.layer],
+				&layersurface->link);
 	}
 
 	if (layer_surface->current.committed == 0 && l->mapped == layer_surface->surface->mapped)
@@ -981,10 +991,10 @@ createkeyboardgroup(void)
 void
 createlayersurface(struct wl_listener *listener, void *data)
 {
-	struct wlr_layer_surface_v1 *layer_surface = data;
-	LayerSurface *l;
-	struct wlr_surface *surface = layer_surface->surface;
-	struct wlr_scene_tree *scene_layer = layers[layermap[layer_surface->pending.layer]];
+	struct wlr_layer_surface_v1 *wlr_layer_surface = data;
+	LayerSurface *layersurface;
+	struct wlr_layer_surface_v1_state old_state;
+	struct wlr_scene_tree *l = layers[layermap[wlr_layer_surface->pending.layer]];
 
 	if (!layer_surface->output
 			&& !(layer_surface->output = selmon ? selmon->wlr_output : NULL)) {
@@ -1006,8 +1016,23 @@ createlayersurface(struct wl_listener *listener, void *data)
 			< ZWLR_LAYER_SHELL_V1_LAYER_TOP ? layers[LyrTop] : scene_layer);
 	l->scene->node.data = l->popups->node.data = l;
 
-	wl_list_insert(&l->mon->layers[layer_surface->pending.layer],&l->link);
-	wlr_surface_send_enter(surface, layer_surface->output);
+	layersurface->scene_layer = wlr_scene_layer_surface_v1_create(l, wlr_layer_surface);
+	layersurface->scene = layersurface->scene_layer->tree;
+	layersurface->popups = wlr_layer_surface->surface->data = wlr_scene_tree_create(l);
+
+	layersurface->scene->node.data = layersurface;
+
+	wl_list_insert(&layersurface->mon->layers[wlr_layer_surface->pending.layer],
+			&layersurface->link);
+
+	/* Temporarily set the layer's current state to pending
+	 * so that we can easily arrange it
+	 */
+	old_state = wlr_layer_surface->current;
+	wlr_layer_surface->current = wlr_layer_surface->pending;
+	layersurface->mapped = 1;
+	arrangelayers(layersurface->mon);
+	wlr_layer_surface->current = old_state;
 }
 
 void
@@ -2426,6 +2451,8 @@ setsel(struct wl_listener *listener, void *data)
 void
 setup(void)
 {
+	int layer;
+
 	/* Set up signal handlers */
 	struct sigaction sa = {.sa_flags = SA_RESTART, .sa_handler = sigchld};
 	sigemptyset(&sa.sa_mask);
@@ -2448,11 +2475,8 @@ setup(void)
 
 	/* Initialize the scene graph used to lay out windows */
 	scene = wlr_scene_create();
-	root_bg = wlr_scene_rect_create(&scene->tree, 0, 0, rootcolor);
-	for (i = 0; i < NUM_LAYERS; i++)
-		layers[i] = wlr_scene_tree_create(&scene->tree);
-	drag_icon = wlr_scene_tree_create(&scene->tree);
-	wlr_scene_node_place_below(&drag_icon->node, &layers[LyrBlock]->node);
+	for (layer = 0; layer < NUM_LAYERS; layer++)
+		layers[layer] = wlr_scene_tree_create(&scene->tree);
 
 	/* Autocreates a renderer, either Pixman, GLES2 or Vulkan for us. The user
 	 * can also specify a renderer using the WLR_RENDERER env var.
@@ -2683,11 +2707,15 @@ void
 startdrag(struct wl_listener *listener, void *data)
 {
 	struct wlr_drag *drag = data;
+	struct wlr_scene_tree *icon;
+
 	if (!drag->icon)
 		return;
 
-	drag->icon->data = &wlr_scene_drag_icon_create(drag_icon, drag->icon)->node;
-	LISTEN_STATIC(&drag->icon->events.destroy, destroydragicon);
+	drag->icon->data = icon = wlr_scene_subsurface_tree_create(&scene->tree, drag->icon->surface);
+	wlr_scene_node_place_below(&icon->node, &layers[LyrBlock]->node);
+	motionnotify(0);
+	wl_signal_add(&drag->icon->events.destroy, &drag_icon_destroy);
 }
 
 void
@@ -3028,7 +3056,7 @@ xytonode(double x, double y, struct wlr_surface **psurface,
 			continue;
 
 		if (node->type == WLR_SCENE_NODE_BUFFER)
-			surface = wlr_scene_surface_try_from_buffer(
+			surface = wlr_scene_surface_from_buffer(
 					wlr_scene_buffer_from_node(node))->surface;
 		/* Walk the tree to find a node that knows the client */
 		for (pnode = node; pnode && !c; pnode = &pnode->parent->node)
