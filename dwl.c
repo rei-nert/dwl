@@ -290,8 +290,7 @@ static void focusmon(const Arg *arg);
 static void focusstack(const Arg *arg);
 static Client *focustop(Monitor *m);
 static void fullscreennotify(struct wl_listener *listener, void *data);
-static void gpureset(struct wl_listener *listener, void *data);
-static void handlesig(int signo);
+static int handlesig(int signo, void *data);
 static void incnmaster(const Arg *arg);
 static void inputdevice(struct wl_listener *listener, void *data);
 static int keybinding(uint32_t mods, xkb_keycode_t keycode);
@@ -332,7 +331,6 @@ static void setmon(Client *c, Monitor *m, uint32_t newtags);
 static void setpsel(struct wl_listener *listener, void *data);
 static void setsel(struct wl_listener *listener, void *data);
 static void setup(void);
-static void sigchld(int unused);
 static void spawn(const Arg *arg);
 static void startdrag(struct wl_listener *listener, void *data);
 static void tag(const Arg *arg);
@@ -361,7 +359,8 @@ static pid_t child_pid = -1;
 static int locked;
 static void *exclusive_focus;
 static struct wl_display *dpy;
-static struct wl_event_loop *event_loop;
+static struct wl_event_loop *eventloop;
+static struct wl_event_source *sighandler[4];
 static struct wlr_backend *backend;
 static struct wlr_scene *scene;
 static struct wlr_scene_tree *layers[NUM_LAYERS];
@@ -698,7 +697,7 @@ checkidleinhibitor(struct wlr_surface *exclude)
 void
 cleanup(void)
 {
-	cleanuplisteners();
+	int i;
 #ifdef XWAYLAND
 	wlr_xwayland_destroy(xwayland);
 	xwayland = NULL;
@@ -709,13 +708,11 @@ cleanup(void)
 		waitpid(child_pid, NULL, 0);
 	}
 	wlr_xcursor_manager_destroy(cursor_mgr);
-
-	destroykeyboardgroup(&kb_group->destroy, NULL);
-
-	/* If it's not destroyed manually it will cause a use-after-free of wlr_seat.
-	 * Destroy it until it's fixed in the wlroots side */
-	wlr_backend_destroy(backend);
-
+	wlr_cursor_destroy(cursor);
+	wlr_output_layout_destroy(output_layout);
+	wlr_seat_destroy(seat);
+	for (i = 0; i < LENGTH(sighandler); i++)
+		wl_event_source_remove(sighandler[i]);
 	wl_display_destroy(dpy);
 	/* Destroy after the wayland display (when the monitors are already destroyed)
 	   to avoid destroying them with an invalid scene output. */
@@ -977,7 +974,7 @@ createkeyboardgroup(void)
 	LISTEN(&group->wlr_group->keyboard.events.key, &group->key, keypress);
 	LISTEN(&group->wlr_group->keyboard.events.modifiers, &group->modifiers, keypressmod);
 
-	group->key_repeat_source = wl_event_loop_add_timer(event_loop, keyrepeat, group);
+	kb->key_repeat_source = wl_event_loop_add_timer(eventloop, keyrepeat, kb);
 
 	/* A seat can only have one keyboard, but this is a limitation of the
 	 * Wayland protocol - not wlroots. We assign all connected keyboards to the
@@ -1549,6 +1546,28 @@ fullscreennotify(struct wl_listener *listener, void *data)
 {
 	Client *c = wl_container_of(listener, c, fullscreen);
 	setfullscreen(c, client_wants_fullscreen(c));
+}
+
+int
+handlesig(int signo, void *data)
+{
+	if (signo == SIGCHLD) {
+#ifdef XWAYLAND
+		siginfo_t in;
+		/* wlroots expects to reap the XWayland process itself, so we
+		 * use WNOWAIT to keep the child waitable until we know it's not
+		 * XWayland.
+		 */
+		while (!waitid(P_ALL, 0, &in, WEXITED|WNOHANG|WNOWAIT) && in.si_pid
+				&& (!xwayland || in.si_pid != xwayland->server->pid))
+			waitpid(in.si_pid, NULL, 0);
+#else
+		while (waitpid(-1, NULL, WNOHANG) > 0);
+#endif
+	} else if (signo == SIGINT || signo == SIGTERM) {
+		quit(NULL);
+	}
+	return 0;
 }
 
 void
@@ -2276,12 +2295,6 @@ run(char *startup_cmd)
 		close(piperw[1]);
 		close(piperw[0]);
 	}
-
-	/* Mark stdout as non-blocking to avoid people who does not close stdin
-	 * nor consumes it in their startup script getting dwl frozen */
-	if (fd_set_nonblock(STDOUT_FILENO) < 0)
-		close(STDOUT_FILENO);
-
 	printstatus();
 
 	/* At this point the outputs are initialized, choose initial selmon based on
@@ -2451,20 +2464,14 @@ setsel(struct wl_listener *listener, void *data)
 void
 setup(void)
 {
-	int layer;
-
-	/* Set up signal handlers */
-	struct sigaction sa = {.sa_flags = SA_RESTART, .sa_handler = sigchld};
-	sigemptyset(&sa.sa_mask);
-	sigaction(SIGCHLD, &sa, NULL);
-
-	sa.sa_handler = quitsignal;
-	sigaction(SIGINT, &sa, NULL);
-	sigaction(SIGTERM, &sa, NULL);
+	int i, sig[] = {SIGCHLD, SIGINT, SIGTERM, SIGPIPE};
 
 	/* The Wayland display is managed by libwayland. It handles accepting
 	 * clients from the Unix socket, manging Wayland globals, and so on. */
 	dpy = wl_display_create();
+	eventloop = wl_display_get_event_loop(dpy);
+	for (i = 0; i < LENGTH(sighandler); i++)
+		sighandler[i] = wl_event_loop_add_signal(eventloop, sig[i], handlesig, NULL);
 
 	/* The backend is a wlroots feature which abstracts the underlying input and
 	 * output hardware. The autocreate option will choose the most suitable
@@ -2475,8 +2482,8 @@ setup(void)
 
 	/* Initialize the scene graph used to lay out windows */
 	scene = wlr_scene_create();
-	for (layer = 0; layer < NUM_LAYERS; layer++)
-		layers[layer] = wlr_scene_tree_create(&scene->tree);
+	for (i = 0; i < NUM_LAYERS; i++)
+		layers[i] = wlr_scene_tree_create(&scene->tree);
 
 	/* Autocreates a renderer, either Pixman, GLES2 or Vulkan for us. The user
 	 * can also specify a renderer using the WLR_RENDERER env var.
@@ -2667,28 +2674,6 @@ setup(void)
 	} else {
 		fprintf(stderr, "failed to setup XWayland X server, continuing without it\n");
 	}
-#endif
-}
-
-void
-sigchld(int unused)
-{
-#ifdef XWAYLAND
-	siginfo_t in;
-	/* We should be able to remove this function in favor of a simple
-	 *	struct sigaction sa = {.sa_handler = SIG_IGN};
-	 * 	sigaction(SIGCHLD, &sa, NULL);
-	 * but the Xwayland implementation in wlroots currently prevents us from
-	 * setting our own disposition for SIGCHLD.
-	 */
-	/* WNOWAIT leaves the child in a waitable state, in case this is the
-	 * XWayland process
-	 */
-	while (!waitid(P_ALL, 0, &in, WEXITED|WNOHANG|WNOWAIT) && in.si_pid
-			&& (!xwayland || in.si_pid != xwayland->server->pid))
-		waitpid(in.si_pid, NULL, 0);
-#else
-	while (waitpid(-1, NULL, WNOHANG) > 0);
 #endif
 }
 
