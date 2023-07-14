@@ -290,7 +290,7 @@ static void focusmon(const Arg *arg);
 static void focusstack(const Arg *arg);
 static Client *focustop(Monitor *m);
 static void fullscreennotify(struct wl_listener *listener, void *data);
-static int handlesig(int signo, void *data);
+static void handlesig(int signo);
 static void incnmaster(const Arg *arg);
 static void inputdevice(struct wl_listener *listener, void *data);
 static int keybinding(uint32_t mods, xkb_keycode_t keycode);
@@ -359,8 +359,6 @@ static pid_t child_pid = -1;
 static int locked;
 static void *exclusive_focus;
 static struct wl_display *dpy;
-static struct wl_event_loop *eventloop;
-static struct wl_event_source *sighandler[4];
 static struct wlr_backend *backend;
 static struct wlr_scene *scene;
 static struct wlr_scene_tree *layers[NUM_LAYERS];
@@ -698,7 +696,6 @@ checkidleinhibitor(struct wlr_surface *exclude)
 void
 cleanup(void)
 {
-	int i;
 #ifdef XWAYLAND
 	wlr_xwayland_destroy(xwayland);
 	xwayland = NULL;
@@ -716,8 +713,6 @@ cleanup(void)
 	wlr_cursor_destroy(cursor);
 	wlr_output_layout_destroy(output_layout);
 	wlr_seat_destroy(seat);
-	for (i = 0; i < LENGTH(sighandler); i++)
-		wl_event_source_remove(sighandler[i]);
 	wl_display_destroy(dpy);
 	/* Destroy after the wayland display (when the monitors are already destroyed)
 	   to avoid destroying them with an invalid scene output. */
@@ -979,7 +974,8 @@ createkeyboardgroup(void)
 	LISTEN(&group->wlr_group->keyboard.events.key, &group->key, keypress);
 	LISTEN(&group->wlr_group->keyboard.events.modifiers, &group->modifiers, keypressmod);
 
-	kb->key_repeat_source = wl_event_loop_add_timer(eventloop, keyrepeat, kb);
+	kb->key_repeat_source = wl_event_loop_add_timer(
+			wl_display_get_event_loop(dpy), keyrepeat, kb);
 
 	/* A seat can only have one keyboard, but this is a limitation of the
 	 * Wayland protocol - not wlroots. We assign all connected keyboards to the
@@ -1553,8 +1549,8 @@ fullscreennotify(struct wl_listener *listener, void *data)
 	setfullscreen(c, client_wants_fullscreen(c));
 }
 
-int
-handlesig(int signo, void *data)
+void
+handlesig(int signo)
 {
 	if (signo == SIGCHLD) {
 #ifdef XWAYLAND
@@ -1572,7 +1568,6 @@ handlesig(int signo, void *data)
 	} else if (signo == SIGINT || signo == SIGTERM) {
 		quit(NULL);
 	}
-	return 0;
 }
 
 void
@@ -2457,13 +2452,15 @@ void
 setup(void)
 {
 	int i, sig[] = {SIGCHLD, SIGINT, SIGTERM, SIGPIPE};
+	struct sigaction sa = {.sa_flags = SA_RESTART, .sa_handler = handlesig};
+	sigemptyset(&sa.sa_mask);
+
+	for (i = 0; i < LENGTH(sig); i++)
+		sigaction(sig[i], &sa, NULL);
 
 	/* The Wayland display is managed by libwayland. It handles accepting
 	 * clients from the Unix socket, manging Wayland globals, and so on. */
 	dpy = wl_display_create();
-	eventloop = wl_display_get_event_loop(dpy);
-	for (i = 0; i < LENGTH(sighandler); i++)
-		sighandler[i] = wl_event_loop_add_signal(eventloop, sig[i], handlesig, NULL);
 
 	/* The backend is a wlroots feature which abstracts the underlying input and
 	 * output hardware. The autocreate option will choose the most suitable
