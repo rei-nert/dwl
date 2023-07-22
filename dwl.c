@@ -1739,6 +1739,13 @@ locksession(struct wl_listener *listener, void *data)
 }
 
 void
+maplayersurfacenotify(struct wl_listener *listener, void *data)
+{
+	LayerSurface *l = wl_container_of(listener, l, map);
+	motionnotify(0);
+}
+
+void
 mapnotify(struct wl_listener *listener, void *data)
 {
 	/* Called when the surface is mapped, or ready to display on-screen. */
